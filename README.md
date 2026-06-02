@@ -126,7 +126,7 @@ pip install -r requirements.txt
 Her kullanımda şu 3 komutu çalıştır:
 
 ```bash
-cd "C:\Users\KULLANICI_ADIN\Desktop\Donemici_Proje"
+cd "C:\Users\Alperen Sezer\Desktop\Donemici_Proje"
 .\venv\Scripts\activate
 streamlit run app.py
 ```
@@ -253,7 +253,7 @@ Az örnekli sınıflar için ham ses düzeyinde 4 farklı dönüşüm uygulanır
 |-----|-------|-------|------------|----------|
 | Faz 1 | Mayıs 2026 | KNN → SVM | ZCR, F0, Energy, MFCC, ΔMFCC, Spectral, Chroma | %65.3 |
 | Faz 2 | Mayıs 2026 | SVM + RF Ensemble | + Tempo (BPM), Veri Artırma | %65.8 |
-| Faz 3 | Haziran 2026 | SVM + RF + XGBoost + MLP | + Ses Düzeyi Augmentation, Soft Voting | **%98.4** |
+| Faz 3 | Haziran 2026 | SVM + RF + XGBoost + MLP | + Ses Düzeyi Augmentation, Soft Voting | **72.3** |
 
 ---
 

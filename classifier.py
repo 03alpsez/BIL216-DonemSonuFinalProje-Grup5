@@ -215,20 +215,12 @@ def train_and_evaluate(results_df: pd.DataFrame,
                        wav_paths: dict = None,
                        k=None, n_folds: int = 5):
     """
-    4'lü Ensemble (SVM+RF+XGB+MLP) + Soft Voting
-    + Ses Düzeyi Veri Artırma + Stratified K-Fold CV
+    4'lü Ensemble (SVM+RF+XGB+MLP) + Soft Voting + Stratified K-Fold CV
 
-    DÜZELTME: Augmented özellikler CV'den ÖNCE bir kez hesaplanır.
-    CV döngüsü içinde tekrar tekrar ses işlenmez → 10x hızlanır.
-
-    Parametreler:
-        results_df : özellik + Gercek_Duygu sütunları
-        wav_paths  : {Dosya_Adi: tam_yol} dict'i (ses artırma için)
-                     None ise ses artırma atlanır
-
-    Döndürür:
-        accuracy, predictions, conf_matrix,
-        models (list), scaler, le, valid_indices, best_params
+    SIZINTI DÜZELTMESİ:
+      - Scaler her fold içinde SADECE eğitim orijinalleriyle fit edilir.
+      - Artırılmış örnekler sınıfa göre değil, KAYNAK ÖRNEĞE göre eklenir;
+        böylece bir test kaydının artırılmış kopyaları eğitime sızmaz.
     """
     labels = list(EMOTION_MAP.keys())
     df = results_df.dropna(subset=["Gercek_Duygu"]).copy()
@@ -241,18 +233,14 @@ def train_and_evaluate(results_df: pd.DataFrame,
         acc, conf = evaluate(df["Gercek_Duygu"].tolist(), preds)
         return acc, preds, conf, None, None, None, valid_indices, {}
 
-    X_base = build_feature_matrix(df)
+    X_base = build_feature_matrix(df)          # ÖLÇEKLENMEMİŞ orijinaller
     y_base = df["Gercek_Duygu"].values
-
     le     = LabelEncoder().fit(labels)
-    scaler = StandardScaler().fit(X_base)
-    X_scaled = scaler.transform(X_base)
 
-    # ── Ses artırma: CV'den ÖNCE bir kez yap ──
-    # Sadece eğitim setini büyütmek için kullanılacak ekstra veriler
-    X_extra, y_extra = [], []
+    # ── Ses artırma: bir kez hesapla, kaynağı takip et, ÖLÇEKLENMEMİŞ sakla ──
+    X_extra_raw, y_extra, origin_idx = [], [], []
     if wav_paths:
-        for fname, label in zip(df["Dosya_Adi"].values, y_base):
+        for idx, (fname, label) in enumerate(zip(df["Dosya_Adi"].values, y_base)):
             fpath = wav_paths.get(fname)
             if fpath is None:
                 continue
@@ -260,20 +248,19 @@ def train_and_evaluate(results_df: pd.DataFrame,
                 aug_list = extract_features_augmented(
                     fpath, modes=["noise", "pitch+", "pitch-", "stretch"]
                 )
-                for af in aug_list[1:]:   # orijinal atla, sadece artırılmışlar
-                    row  = feats_dict_to_row(af)
-                    xrow = scaler.transform(
-                        np.array([[row[f] for f in ALL_FEATURES]])
-                    )
-                    X_extra.append(xrow[0])
+                for af in aug_list[1:]:        # orijinali atla
+                    row = feats_dict_to_row(af)
+                    X_extra_raw.append([row[f] for f in ALL_FEATURES])
                     y_extra.append(label)
+                    origin_idx.append(idx)     # hangi orijinal kayıttan geldi
             except Exception:
                 continue
 
-    X_extra = np.array(X_extra) if X_extra else np.empty((0, X_scaled.shape[1]))
-    y_extra = np.array(y_extra) if y_extra else np.array([], dtype=object)
+    X_extra_raw = np.array(X_extra_raw) if X_extra_raw else np.empty((0, X_base.shape[1]))
+    y_extra     = np.array(y_extra)     if len(y_extra)  else np.array([], dtype=object)
+    origin_idx  = np.array(origin_idx, dtype=int)
 
-    # ── CV döngüsü (artık ses işleme yok, sadece model eğitimi) ──
+    # ── CV döngüsü ──
     min_class    = min(np.bincount([labels.index(l) for l in y_base]))
     actual_folds = max(2, min(n_folds, min_class))
     cv           = StratifiedKFold(n_splits=actual_folds, shuffle=True, random_state=42)
@@ -287,23 +274,19 @@ def train_and_evaluate(results_df: pd.DataFrame,
     for params in _PARAM_GRID:
         cv_preds = np.full(len(y_base), "?", dtype=object)
         try:
-            for train_idx, test_idx in cv.split(X_scaled, y_base):
-                X_tr_orig = X_scaled[train_idx]
-                y_tr_orig = y_base[train_idx]
-                X_te      = X_scaled[test_idx]
+            for train_idx, test_idx in cv.split(X_base, y_base):
+                # Scaler SADECE eğitim orijinalleriyle fit edilir (test sızmaz)
+                scaler = StandardScaler().fit(X_base[train_idx])
+                X_tr = scaler.transform(X_base[train_idx])
+                X_te = scaler.transform(X_base[test_idx])
+                y_tr = y_base[train_idx]
 
-                # Artırılmış örnekleri eğitim setine ekle
-                if len(X_extra) > 0:
-                    # Sadece bu fold'un eğitim etiketi setindeki sınıflara ait ekstraları al
-                    train_labels_set = set(y_tr_orig)
-                    mask = np.array([l in train_labels_set for l in y_extra])
-                    if mask.any():
-                        X_tr = np.vstack([X_tr_orig, X_extra[mask]])
-                        y_tr = np.concatenate([y_tr_orig, y_extra[mask]])
-                    else:
-                        X_tr, y_tr = X_tr_orig, y_tr_orig
-                else:
-                    X_tr, y_tr = X_tr_orig, y_tr_orig
+                # Artırılmışlar: SADECE bu fold'un eğitimindeki ÖRNEKLERDEN gelenler
+                if len(X_extra_raw) > 0:
+                    keep = np.isin(origin_idx, train_idx)   # örneğe göre, sınıfa DEĞİL
+                    if keep.any():
+                        X_tr = np.vstack([X_tr, scaler.transform(X_extra_raw[keep])])
+                        y_tr = np.concatenate([y_tr, y_extra[keep]])
 
                 svm, rf, xgb, mlp = _make_models(params["C"], params["gamma"])
                 y_tr_enc = le.transform(y_tr)
@@ -328,12 +311,13 @@ def train_and_evaluate(results_df: pd.DataFrame,
 
     accuracy, conf = evaluate(y_base.tolist(), best_preds)
 
-    # ── Final model: tüm veri + artırılmışlar ──
-    if len(X_extra) > 0:
-        X_final = np.vstack([X_scaled, X_extra])
-        y_final = np.concatenate([y_base, y_extra])
-    else:
-        X_final, y_final = X_scaled, y_base
+    # ── Final model: tüm orijinaller + artırılmışlar (scaler orijinallere fit) ──
+    final_scaler = StandardScaler().fit(X_base)
+    X_final = final_scaler.transform(X_base)
+    y_final = y_base
+    if len(X_extra_raw) > 0:
+        X_final = np.vstack([X_final, final_scaler.transform(X_extra_raw)])
+        y_final = np.concatenate([y_final, y_extra])
 
     svm_f, rf_f, xgb_f, mlp_f = _make_models(best_params["C"], best_params["gamma"])
     y_final_enc = le.transform(y_final)
@@ -346,7 +330,7 @@ def train_and_evaluate(results_df: pd.DataFrame,
     rf_fw  = _AlignedProbaWrapper(rf_f,  le)
 
     final_models = [svm_fw, rf_fw, _XGBWrap(xgb_f), mlp_f]
-    return accuracy, best_preds, conf, final_models, scaler, le, valid_indices, best_params
+    return accuracy, best_preds, conf, final_models, final_scaler, le, valid_indices, best_params
 
 
 def predict_single_with_model(feats, models, scaler, le=None):
